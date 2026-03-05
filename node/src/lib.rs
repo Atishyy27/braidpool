@@ -1,5 +1,5 @@
 //These implementations must be defined under lib.rs as they are required for intergration tests
-use crate::{db::db_handlers::prepare_bead_tuple_data, rpc_server::DashboardEvents};
+use crate::{db::db_handlers::prepare_bead_tuple_data, rpc_server::DashboardEvents, utils::compute_block_hash};
 use bitcoin::{
     consensus::encode::deserialize, ecdsa::Signature, pow::CompactTargetExt, BlockHash,
     CompactTarget, EcdsaSighashType, Txid,
@@ -306,7 +306,7 @@ impl SwarmHandler {
         //Committing parents data in bead
         for tip_bead in tips_index {
             let current_tip_bead = braid_data.beads.get(*tip_bead).unwrap();
-            parent_hash_set.insert(current_tip_bead.block_header.block_hash());
+            parent_hash_set.insert(braid_data.compute_bead_hash(current_tip_bead));
             time_hash_set
                 .0
                 .push(current_tip_bead.committed_metadata.start_timestamp);
@@ -369,18 +369,22 @@ impl SwarmHandler {
         match status {
             AddBeadStatus::BeadAdded { .. } => {
                 let new_tips: Vec<_> = braid_data.tips.iter().map(|&idx| idx).collect();
-                let bead_hash = weak_share.block_header.block_hash();
+                let bead_hash = compute_block_hash(&weak_share.block_header, &braid_data.network_name);
                 info!(
                     hash = %bead_hash,
                     new_tips = ?new_tips,
                     "Braid extended successfully"
                 );
                 //Considering the index of the beads in braid will be same as the (insertion ids-1)
-                let bead_id = braid_data.bead_index_mapping.get(&bead_hash).unwrap();
+                let bead_id = braid_data
+                    .bead_index_mapping
+                    .get(&bead_hash)
+                    .unwrap();
                 let (txs_json, relative_json, parent_timestamp_json) = prepare_bead_tuple_data(
                     &braid_data.beads,
                     &braid_data.bead_index_mapping,
                     &weak_share,
+                    &braid_data.network_name,
                 )
                 .unwrap();
                 let _db_insertion_command = match self
@@ -410,7 +414,7 @@ impl SwarmHandler {
                 let res = self
                     .dashboard_notification_sender
                     .new_bead
-                    .send(Some(weak_share));
+                    .send(Some(weak_share.clone()));
                 match res {
                     Ok(_) => {
                         debug!("Passing self mined bead to the dashboard notifier");
@@ -446,7 +450,7 @@ impl SwarmHandler {
                 };
             }
             _ => {
-                warn!(status = ?status, hash = %weak_share.block_header.block_hash(),
+                warn!(status = ?status, hash = %braid_data.compute_bead_hash(&weak_share),
                     "Failed to extend Braid")
             }
         }
