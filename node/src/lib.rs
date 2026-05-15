@@ -1,5 +1,8 @@
 //These implementations must be defined under lib.rs as they are required for intergration tests
-use crate::{db::db_handlers::prepare_bead_tuple_data, rpc_server::DashboardEvents, utils::compute_block_hash};
+use crate::{
+    db::db_handlers::prepare_bead_tuple_data, rpc_server::DashboardEvents,
+    utils::compute_block_hash,
+};
 use bitcoin::{
     consensus::encode::deserialize, ecdsa::Signature, BlockHash, CompactTarget, EcdsaSighashType,
     Txid,
@@ -370,17 +373,15 @@ impl SwarmHandler {
         match status {
             AddBeadStatus::BeadAdded { .. } => {
                 let new_tips: Vec<_> = braid_data.tips.iter().map(|&idx| idx).collect();
-                let bead_hash = compute_block_hash(&weak_share.block_header, &braid_data.network_name);
+                let bead_hash =
+                    compute_block_hash(&weak_share.block_header, &braid_data.network_name);
                 info!(
                     hash = %bead_hash,
                     new_tips = ?new_tips,
                     "Braid extended successfully"
                 );
                 //Considering the index of the beads in braid will be same as the (insertion ids-1)
-                let bead_id = braid_data
-                    .bead_index_mapping
-                    .get(&bead_hash)
-                    .unwrap();
+                let bead_id = braid_data.bead_index_mapping.get(&bead_hash).unwrap();
                 let (txs_json, relative_json, parent_timestamp_json) = prepare_bead_tuple_data(
                     &braid_data.beads,
                     &braid_data.bead_index_mapping,

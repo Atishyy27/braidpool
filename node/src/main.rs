@@ -66,8 +66,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     setup_tracing()?;
     // Parse CLI arguments
     let args = cli::Cli::parse();
-    let network_name = args.network.clone().unwrap_or_else(|| "main".to_string());
-
+    let mut network_name = args.network.clone().unwrap_or_else(|| "main".to_string());
     // Validate network
     let is_cpunet = Cpunet::is_cpunet_name(&network_name);
     match network_name.as_str() {
@@ -81,6 +80,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 "Invalid network specified"
             );
             info!(fallback = "regtest", "Using fallback network");
+            network_name = "regtest".to_string();
         }
     }
     let (mut ibd_manager, ibd_command_tx) = IBDManager::new();
@@ -164,7 +164,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let latest_template_for_ipc = latest_template.clone();
     let latest_template_merkle_branch_for_ipc = latest_template_merkle_branch.clone();
     let network_name_for_ipc = network_name.clone();
-    
+
     //Connection mapping for all the downstream connection connected to the stratum server
     let connection_mapping = Arc::new(tokio::sync::RwLock::new(ConnectionMapping::new()));
     // Clone connection_mapping for RPC server before it's used in async move blocks
@@ -602,8 +602,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                          let result_bead: Result<Bead, bitcoin::consensus::encode::Error> = deserialize(&message.data);
                          match result_bead {
                              Ok(bead) => {
-                                // Handle the received bead here
-                                let mut braid_data = braid.write().await;
+                                 // Handle the received bead here
+                                 let mut braid_data = braid.write().await;
+                                 let bead_hash = braid_data.compute_bead_hash(&bead);
+                                 info!(bead = ?bead, hash = %bead_hash, "Received bead");
                                 let status = {
                                      braid_data.extend(&bead)
                                  };
@@ -656,14 +658,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                      //Considering the index of the beads in braid will be same as the (insertion ids-1)
                                         let bead_id = match braid_data
                                             .bead_index_mapping
-                                            .get(&braid_data.compute_bead_hash(&bead)) {
+                                            .get(&bead_hash) {
                                             Some(id) => id,
                                             None => {
-                                                error!(bead_hash = ?braid_data.compute_bead_hash(&bead), "Bead ID not found in index mapping");
+                                                error!(bead_hash = ?bead_hash, "Bead ID not found in index mapping");
                                                 continue;
                                             }
                                         };
-                                        let bead_hash = bead.block_header.block_hash();
                                         let (txs_json, relative_json, parent_timestamp_json) = match prepare_bead_tuple_data(
                                             &braid_data.beads,
                                             &braid_data.bead_index_mapping,
@@ -672,7 +673,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         ){
                                             Ok(received_tuples)=>received_tuples,
                                             Err(error)=>{
-                                                error!("An error occurred while preparing bead tuple data for bead with beadhash - {:?} due to {:?}",braid_data.compute_bead_hash(&bead),error);
+                                                error!("An error occurred while preparing bead tuple data for bead with beadhash - {:?} due to {:?}",bead_hash,error);
                                                 continue;
                                             }
                                         };
@@ -782,10 +783,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     } else if let braid::AddBeadStatus::BeadAdded { .. } = status {
                                         let bead_id = match braid_data
                                             .bead_index_mapping
-                                            .get(&braid_data.compute_bead_hash(&bead)) {
+                                            .get(&bead_hash) {
                                             Some(id) => id,
                                             None => {
-                                                error!(bead_hash = ?braid_data.compute_bead_hash(&bead), "Bead ID not found in index mapping (GetAllBeads)");
+                                                error!(bead_hash = ?bead_hash, "Bead ID not found in index mapping (GetAllBeads)");
                                                 continue;
                                             }
                                         };
@@ -797,7 +798,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                         ){
                                             Ok(received_tuples)=>received_tuples,
                                             Err(error)=>{
-                                                error!("An error occurred while preparing bead tuple data for bead with beadhash - {:?} due to {:?}",braid_data.compute_bead_hash(&bead),error);
+                                                error!("An error occurred while preparing bead tuple data for bead with beadhash - {:?} due to {:?}",bead_hash,error);
                                                 continue;
                                             }
                                         };
@@ -1109,8 +1110,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                     };
                                     for bead in beads.into_iter() {
                                         let mut braid_data = braid.write().await;
+                                        let bead_hash = braid_data.compute_bead_hash(&bead);
                                         let status = braid_data.extend(&bead);
-                                        let curr_beadhash = braid_data.compute_bead_hash(&bead).to_string();
+                                        let curr_beadhash = bead_hash.to_string();
                                         if let braid::AddBeadStatus::InvalidBead = status {
                                             warn!("Invalid bead received from peer");
                                             // update the peer manager about the invalid bead
@@ -1122,10 +1124,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
                                             let bead_id = match braid_data
                                                 .bead_index_mapping
-                                                .get(&braid_data.compute_bead_hash(&bead)) {
+                                                .get(&bead_hash) {
                                                 Some(id) => id,
                                                 None => {
-                                                    error!(bead_hash = ?braid_data.compute_bead_hash(&bead), "Bead ID not found in index mapping (GetBeadsAfter)");
+                                                    error!(bead_hash = ?bead_hash, "Bead ID not found in index mapping (GetBeadsAfter)");
                                                     continue;
                                                 }
                                             };
