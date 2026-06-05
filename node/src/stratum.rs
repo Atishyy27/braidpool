@@ -126,7 +126,7 @@ pub struct StratumServerConfig {
     /// Indicates audit mode.
     pub audit_mode: bool,
     /// Audit mode miner weak difficulty
-    pub audit_miner_difficulty: f64,
+    pub audit_miner_difficulty: Option<f64>,
 }
 
 impl Default for StratumServerConfig {
@@ -140,7 +140,7 @@ impl Default for StratumServerConfig {
             maximum_difficulty: None,
             solo_address: None,
             audit_mode: false,
-            audit_miner_difficulty: 100.0,
+            audit_miner_difficulty: None,
         }
     }
 }
@@ -245,7 +245,7 @@ pub struct DownstreamClient {
     // Payout address used in the audit mode
     pub payout_address: Option<String>,
     // Refers to the miner difficulty in audit mode
-    pub audit_miner_difficulty: f64,
+    pub audit_miner_difficulty: Option<f64>,
 }
 impl DownstreamClient {
     /// A helper function to keep connection_id immutable after assignment
@@ -415,7 +415,7 @@ impl DownstreamClient {
                     };
                     if let Some(diff) = upstream_diff {
                         let miner_difficulty: f64 = if self.is_proxy_mode {
-                            self.audit_miner_difficulty
+                            self.audit_miner_difficulty.unwrap_or(diff)
                         } else {
                             diff
                         };
@@ -697,7 +697,6 @@ impl DownstreamClient {
                     audit_dag,
                     upstream_share_tx,
                     upstream_difficulty,
-                    swarm_handler,
                 )
                 .await;
         }
@@ -1065,7 +1064,6 @@ impl DownstreamClient {
         audit_dag: Option<Arc<Mutex<crate::audit::AuditDAG>>>,
         upstream_share_tx: Option<mpsc::Sender<crate::upstream_pool::UpstreamShare>>,
         upstream_difficulty: Option<f64>,
-        swarm_handler: Arc<Mutex<SwarmHandler>>,
     ) -> Result<StratumResponses, StratumErrors> {
         let ntime_u32 =
             u32::from_str_radix(ntime, 16).map_err(|e| StratumErrors::InvalidMethodParams {
@@ -1111,10 +1109,11 @@ impl DownstreamClient {
         let mut candidates = vec![self.extranonce1.clone()];
         candidates.extend(self.extranonce_history.iter().cloned());
         let miner_difficulty = if self.is_proxy_mode {
-            self.audit_miner_difficulty
+            self.audit_miner_difficulty.or(upstream_difficulty)
         } else {
-            100.0
-        };
+            None
+        }
+        .unwrap_or(100.0);
         let miner_target = Self::target_from_difficulty(miner_difficulty);
         let upstream_target = upstream_difficulty
             .map(|d| Self::target_from_difficulty(d))
@@ -1193,7 +1192,6 @@ impl DownstreamClient {
             let share_id = block_hash;
 
             let bead = {
-                let swarm = swarm_handler.lock().await;
                 let payout_address = self
                     .payout_address
                     .as_ref()
@@ -1225,16 +1223,22 @@ impl DownstreamClient {
                     .to_string();
 
                 let (parent_hash_set, time_hash_set) = {
-                    let braid = swarm.braid_arc.read().await;
-                    let mut parents = std::collections::HashSet::new();
+                    let mut parents: Vec<crate::utils::BeadHash> = Vec::new();
                     let mut timestamps = crate::committed_metadata::TimeVec(Vec::new());
-                    for &tip_idx in braid.tips.iter() {
-                        if let Some(tip_bead) = braid.beads.get(tip_idx) {
-                            let standard_hash = tip_bead.block_header.block_hash();
-                            parents.insert(crate::utils::BeadHash::from(standard_hash));
-                            timestamps
-                                .0
-                                .push(tip_bead.committed_metadata.start_timestamp);
+
+                    if let Some(ref dag_mutex) = audit_dag {
+                        let dag = dag_mutex.lock().await;
+                        let mut pairs: Vec<(crate::utils::BeadHash, bitcoin::absolute::Time)> = dag
+                            .active_parents
+                            .iter()
+                            .map(|&(_, block_hash, parent_time)| {
+                                (crate::utils::BeadHash::from(block_hash), parent_time)
+                            })
+                            .collect();
+                        pairs.sort_by_key(|(hash, _)| *hash);
+                        for (hash, time) in pairs {
+                            parents.push(hash);
+                            timestamps.0.push(time);
                         }
                     }
                     if parents.is_empty() {
@@ -1945,7 +1949,7 @@ impl Default for DownstreamClient {
             block_submission_tx: None,
             is_proxy_mode: false,
             payout_address: None,
-            audit_miner_difficulty: 100.0,
+            audit_miner_difficulty: None,
         }
     }
 }
