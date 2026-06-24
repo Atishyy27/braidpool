@@ -2319,7 +2319,7 @@ fn test_get_beads_after_multiple_tips() {
 #[test]
 fn test_extend_without_orphans_promotes_nothing() {
     let genesis = emit_bead();
-    let mut braid = Braid::new(vec![genesis.clone()]);
+    let mut braid = Braid::new(vec![genesis.clone()], "regtest".to_string());
 
     let mut child = emit_bead();
     child
@@ -2343,7 +2343,7 @@ fn test_extend_without_orphans_promotes_nothing() {
 #[test]
 fn test_extend_reports_promoted_orphan() {
     let genesis = emit_bead();
-    let mut braid = Braid::new(vec![genesis.clone()]);
+    let mut braid = Braid::new(vec![genesis.clone()], "regtest".to_string());
 
     let mut child = emit_bead();
     child
@@ -2389,7 +2389,7 @@ fn test_extend_reports_promoted_orphan() {
 #[test]
 fn test_extend_promotes_transitive_orphan_chain() {
     let genesis = emit_bead();
-    let mut braid = Braid::new(vec![genesis.clone()]);
+    let mut braid = Braid::new(vec![genesis.clone()], "regtest".to_string());
 
     let mut a = emit_bead();
     a.committed_metadata

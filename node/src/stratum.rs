@@ -2549,11 +2549,11 @@ mod test {
                 version: BlockVersion::from_consensus(536870912),
                 prev_blockhash: test_template_header.prev_blockhash,
                 merkle_root: merkle_root_for_grind,
-                time: BlockTime::from_u32(grind_ntime),
+                time: grind_ntime,
                 bits: grind_bits,
                 nonce,
             };
-            if grind_target.is_met_by(grind_header.block_hash()) {
+            if grind_target.is_met_by(compute_block_hash(&grind_header, &"cpunet".to_string())) {
                 valid_nonce = nonce;
                 break;
             }
@@ -2587,6 +2587,34 @@ mod test {
                 panic!("Expected StandardResponse, got a different response type");
             }
         }
+
+        let mut complete_coinbase = coinbase_tx_for_grind.clone();
+        complete_coinbase
+            .input
+            .get_mut(0)
+            .unwrap()
+            .witness
+            .push(vec![0u8; 32]);
+        let complete_block_header = BlockHeader {
+            version: BlockVersion::from_consensus(536870912),
+            prev_blockhash: test_template_header.prev_blockhash,
+            merkle_root: merkle_root_for_grind,
+            time: grind_ntime,
+            bits: grind_bits,
+            nonce: valid_nonce,
+        };
+        let complete_block = bitcoin::Block {
+            header: complete_block_header,
+            txdata: vec![complete_coinbase],
+        };
+        let complete_block_hex = hex::encode(serialize(&complete_block));
+
+        let expected_complete_block_hex = "00000020e6ebb395a1e2ba60f17650d790309e21af08062229ad955376ac57430000000090dea459e4b4db9ed0d542fc9415f04312b9b2fc1c3b07bd7a417b715d948ab4337edf68ffff7f200300000001020000000001010000000000000000000000000000000000000000000000000000000000000000ffffffff1e02611e10000000009495ac080000000003000000094272616964706f6f6cffffffff0300f2052a01000000160014e470d0179325db88b55771f6c0a5139dd81d73180000000000000000266a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf900000000000000002a6a286272616964706f6f6c5f626561645f6d657461646174615f686173685f33326201020304050607080120000000000000000000000000000000000000000000000000000000000000000000000000";
+        assert_eq!(complete_block_hex, expected_complete_block_hex);
+
+        assert!(complete_block_hex.starts_with("00000020"));
+        assert!(complete_block_hex
+            .contains("e6ebb395a1e2ba60f17650d790309e21af08062229ad955376ac574300000000"));
     }
     #[test]
     fn prev_hash_test() {

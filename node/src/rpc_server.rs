@@ -2487,8 +2487,8 @@ pub async fn test_subscribe_bead_rpc() {
     )));
     let (proxy_tx, _) = mpsc::unbounded_channel();
 
-    let server_addr = "127.0.0.1:9050";
-    let (_addr, dashboard_events) = run_rpc_server(
+    let server_addr = "127.0.0.1:0";
+    let (addr, dashboard_events) = run_rpc_server(
         Arc::clone(&braid),
         server_addr,
         Arc::new(tokio::sync::RwLock::new(PeerManager::new(8))),
@@ -2501,7 +2501,7 @@ pub async fn test_subscribe_bead_rpc() {
     .unwrap();
 
     let test_ws_client = WsClientBuilder::default()
-        .build(format!("ws://{}", server_addr))
+        .build(format!("ws://{}", addr))
         .await
         .unwrap();
 
