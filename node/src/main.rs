@@ -1805,7 +1805,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                                          //IBD and continue with mining
                                          //Initializing the batch offset for the corresponding sync peer
                                          let (ibd_bridge_tx, _ibd_bridge_rx) = tokio::sync::oneshot::channel::<usize>();
-                                         match ibd_command_tx.send(IBDCommands::UpdateAndFetchBatchOffset { peer_id: peer.to_string(), offset_sender: ibd_bridge_tx, batch_size: IBD_BATCH_SIZE }).await{
+                                         match ibd_command_tx.send(IBDCommands::InitBatchOffset { peer_id: peer.to_string(), offset_sender: ibd_bridge_tx }).await{
                                              Ok(_)=>{
                                                  debug!("Offset Initialized successfully");
                                              },

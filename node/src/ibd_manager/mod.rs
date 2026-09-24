@@ -25,6 +25,13 @@ pub enum IBDCommands {
         offset_sender: tokio::sync::oneshot::Sender<usize>,
         batch_size: usize,
     },
+    /// Starts tracking the batch offset for a sync peer, or reports the offset
+    /// already tracked. Unlike `UpdateAndFetchBatchOffset` this never moves the
+    /// offset, since no batch has been consumed when it is sent.
+    InitBatchOffset {
+        peer_id: String,
+        offset_sender: tokio::sync::oneshot::Sender<usize>,
+    },
     FetchTips {
         peer_id: String,
         tips_sender: tokio::sync::oneshot::Sender<Vec<BeadHash>>,
@@ -151,6 +158,24 @@ impl IBDManager {
                                     error=?error,"Error while initiating batch offset and sending it to request channel"
                                 );
                             }
+                        }
+                    }
+                }
+                IBDCommands::InitBatchOffset {
+                    peer_id,
+                    offset_sender,
+                } => {
+                    // A retry sends GetTips again, so this arrives more than
+                    // once for a peer we are already syncing with.
+                    let current_offset = *self.batch_mapping.entry(peer_id).or_insert(IBD_BATCH_SIZE);
+                    match offset_sender.send(current_offset) {
+                        Ok(_) => {
+                            tracing::info!("Sent the tracked batch offset to request channel");
+                        }
+                        Err(error) => {
+                            tracing::error!(
+                                error=?error, "Error while sending the tracked batch offset to request channel"
+                            );
                         }
                     }
                 }
@@ -310,5 +335,63 @@ impl IBDManager {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+
+    /// An IBD retry resends GetTips, so the offset is initialized twice before
+    /// the first batch of beads is requested. Initializing again must not move
+    /// the offset past a batch nothing has fetched.
+    #[tokio::test]
+    async fn reinitializing_a_peer_does_not_move_the_batch_offset() {
+        let (mut manager, command_sender) = IBDManager::new();
+        let mut receivers = Vec::new();
+
+        for _ in 0..2 {
+            let (offset_sender, offset_receiver) = tokio::sync::oneshot::channel::<usize>();
+            command_sender
+                .send(IBDCommands::InitBatchOffset {
+                    peer_id: "peer".to_string(),
+                    offset_sender,
+                })
+                .await
+                .unwrap();
+            receivers.push(offset_receiver);
+        }
+
+        for _ in 0..2 {
+            let (offset_sender, offset_receiver) = tokio::sync::oneshot::channel::<usize>();
+            command_sender
+                .send(IBDCommands::UpdateAndFetchBatchOffset {
+                    peer_id: "peer".to_string(),
+                    offset_sender,
+                    batch_size: IBD_BATCH_SIZE,
+                })
+                .await
+                .unwrap();
+            receivers.push(offset_receiver);
+        }
+
+        drop(command_sender);
+        manager.run_ibd_handler().await;
+
+        let mut handed_out = Vec::new();
+        for receiver in receivers {
+            handed_out.push(receiver.await.unwrap());
+        }
+
+        assert_eq!(
+            handed_out,
+            vec![
+                IBD_BATCH_SIZE,
+                IBD_BATCH_SIZE,
+                IBD_BATCH_SIZE,
+                IBD_BATCH_SIZE * 2
+            ]
+        );
     }
 }
