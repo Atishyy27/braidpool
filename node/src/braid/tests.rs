@@ -16,6 +16,7 @@ use crate::braid::consensus_functions::updating_ancestors;
 use crate::braid::Cohort;
 use crate::config::PoolNetwork;
 use crate::utils::compute_block_hash;
+use crate::utils::create_test_bead;
 use crate::utils::test_utils::test_utility_functions::loading_braid_from_file;
 use crate::utils::test_utils::test_utility_functions::*;
 use bitcoin::BlockHash;
@@ -2447,4 +2448,70 @@ fn test_extend_promotes_transitive_orphan_chain() {
         braid.orphan_beads.is_empty(),
         "all transitively-connectable orphans should be drained"
     );
+}
+
+/// A chain of orphans used to cost one stack frame per bead: `extend` finished
+/// by calling the promoter, which called `extend` again for each orphan it
+/// freed, so a long enough chain overflowed the stack and took the node down.
+/// #532 reports it at roughly 1500 beads; 800 is enough to abort the old code
+/// here. Feeding the chain child first parks all of it, and the root then has
+/// to promote the lot in one go.
+#[test]
+pub fn long_orphan_chain_is_promoted_without_recursion() {
+    const CHAIN: u32 = 800;
+
+    let root = create_test_bead(0, None);
+    let network = PoolNetwork::Cpunet;
+    let mut parent_hash = compute_block_hash(&root.block_header, network);
+
+    let mut chain = Vec::with_capacity(CHAIN as usize);
+    for nonce in 1..=CHAIN {
+        let bead = create_test_bead(nonce, Some(parent_hash));
+        parent_hash = compute_block_hash(&bead.block_header, network);
+        chain.push(bead);
+    }
+
+    let mut braid = Braid::new(vec![root], network);
+
+    // Deepest child first, so every one of them parks: its parent is the bead
+    // that has not arrived yet.
+    for bead in chain.iter().skip(1).rev() {
+        assert!(matches!(
+            braid.extend(bead),
+            AddBeadStatus::ParentsNotYetReceived
+        ));
+    }
+    assert_eq!(braid.orphan_beads.len(), CHAIN as usize - 1);
+
+    // This one's parent is the root, so it connects and has to drag the whole
+    // parked chain in behind it.
+    let promoted = match braid.extend(&chain[0]) {
+        AddBeadStatus::BeadAdded { promoted_orphans } => promoted_orphans,
+        other => panic!("the root of the chain should connect, got {other:?}"),
+    };
+
+    assert_eq!(promoted.len(), CHAIN as usize - 1);
+    assert!(braid.orphan_beads.is_empty());
+    assert_eq!(braid.beads.len(), CHAIN as usize + 1);
+}
+
+/// The missing-parent branch returns before the already-seen check, so the same
+/// bead resent n times used to park n copies with nothing to evict them.
+#[test]
+pub fn a_resent_orphan_is_parked_once() {
+    let network = PoolNetwork::Cpunet;
+    let root = create_test_bead(0, None);
+    let absent_parent = compute_block_hash(&create_test_bead(99, None).block_header, network);
+    let orphan = create_test_bead(1, Some(absent_parent));
+
+    let mut braid = Braid::new(vec![root], network);
+
+    for _ in 0..50 {
+        assert!(matches!(
+            braid.extend(&orphan),
+            AddBeadStatus::ParentsNotYetReceived
+        ));
+    }
+
+    assert_eq!(braid.orphan_beads.len(), 1);
 }

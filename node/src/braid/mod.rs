@@ -87,7 +87,24 @@ impl Braid {
 impl Braid {
     /// Attempts to extend the braid with the given bead.
     /// Returns true if the bead successfully extended the braid, false otherwise.
+    /// Adds `bead`, then promotes every orphan the addition unblocked.
+    ///
+    /// Promotion is a loop rather than recursion. `extend` used to finish by
+    /// calling `process_orphan_beads`, which called `extend` again for each
+    /// orphan it freed, so a chain of parked orphans cost one stack frame per
+    /// bead and a long enough chain overflowed the stack.
     pub fn extend(&mut self, bead: &Bead) -> AddBeadStatus {
+        match self.add_bead(bead) {
+            AddBeadStatus::BeadAdded { .. } => AddBeadStatus::BeadAdded {
+                promoted_orphans: self.promote_connectable_orphans(),
+            },
+            other => other,
+        }
+    }
+
+    /// Adds a single bead. Promotion of orphans is the caller's job, so that
+    /// this never re-enters itself.
+    fn add_bead(&mut self, bead: &Bead) -> AddBeadStatus {
         // If the braid is empty and bead has no parents, treat as genesis bead
         if self.beads.is_empty() && bead.committed_metadata.parents.is_empty() {
             tracing::debug!(
@@ -113,8 +130,19 @@ impl Braid {
             if !parent_exists {
                 // Try to retrieve the parent
                 //This is not required if a bead exists in DB it would already been extended to local braid as well
-                // Parent not found and can't be retrieved
-                self.orphan_beads.push(bead.clone());
+                // Parent not found and can't be retrieved.
+                // Checked here because this branch returns before the
+                // already-seen check below, so without it the same bead resent
+                // n times parks n copies and nothing ever removes them.
+                let incoming_hash = compute_block_hash(&bead.block_header, self.network);
+                let already_parked = self.orphan_beads.iter().any(|parked| {
+                    compute_block_hash(&parked.block_header, self.network) == incoming_hash
+                });
+
+                if !already_parked && !self.bead_index_mapping.contains_key(&incoming_hash) {
+                    self.orphan_beads.push(bead.clone());
+                }
+
                 return AddBeadStatus::ParentsNotYetReceived;
             }
         }
@@ -198,60 +226,57 @@ impl Braid {
             self.cohort_tips.push(self.tips.clone());
         }
 
-        // Adding this bead may have supplied the missing parent for one or more
-        // parked orphans; promote whichever became connectable and surface them
-        // to the caller.
-        let promoted_orphans = self.process_orphan_beads();
-
-        AddBeadStatus::BeadAdded { promoted_orphans }
+        AddBeadStatus::BeadAdded {
+            promoted_orphans: Vec::new(),
+        }
     }
 
-    fn process_orphan_beads(&mut self) -> Vec<Bead> {
+    /// Promotes every parked orphan whose parents are now present, and keeps
+    /// going until a full pass promotes nothing.
+    ///
+    /// Each promoted orphan can unblock others, which is why this repeats, but
+    /// it repeats in a loop: the recursive version cost a stack frame per bead
+    /// and crashed the node on a chain of roughly 1500.
+    fn promote_connectable_orphans(&mut self) -> Vec<Bead> {
         let mut promoted = Vec::new();
-        // Process orphans in reverse order to maintain proper indexing
-        let mut i = self.orphan_beads.len();
-        while i > 0 {
-            i -= 1;
 
-            // Check if all parents are now available for this orphan
-            let mut all_parents_available = true;
-            for parent_hash in &self.orphan_beads[i].committed_metadata.parents {
-                if !self.bead_index_mapping.contains_key(parent_hash) {
-                    all_parents_available = false;
-                    break;
+        loop {
+            let mut promoted_this_pass = false;
+            let mut i = self.orphan_beads.len();
+
+            while i > 0 {
+                i -= 1;
+
+                let all_parents_available = self.orphan_beads[i]
+                    .committed_metadata
+                    .parents
+                    .iter()
+                    .all(|parent_hash| self.bead_index_mapping.contains_key(parent_hash));
+
+                if !all_parents_available {
+                    continue;
                 }
-            }
 
-            if all_parents_available {
-                // Remove the orphan bead first, then process it
                 let orphan_bead = self.orphan_beads.remove(i);
 
-                // Now extend with the orphan bead
-                match self.extend(&orphan_bead) {
-                    AddBeadStatus::BeadAdded { promoted_orphans } => {
-                        // This orphan is now connected: record it, along with any
-                        // beads its own addition promoted.
+                match self.add_bead(&orphan_bead) {
+                    AddBeadStatus::BeadAdded { .. } => {
                         promoted.push(orphan_bead);
-                        promoted.extend(promoted_orphans);
-                        // Recursively process remaining orphans as this addition
-                        // might enable more orphans to be processed.
-                        promoted.extend(self.process_orphan_beads());
-                        return promoted; // Exit current processing as recursion will handle the rest
+                        promoted_this_pass = true;
                     }
-                    AddBeadStatus::DagAlreadyContainsBead => {
-                        continue;
-                    }
-                    AddBeadStatus::InvalidBead => {
-                        continue;
-                    }
+                    AddBeadStatus::DagAlreadyContainsBead | AddBeadStatus::InvalidBead => {}
                     AddBeadStatus::ParentsNotYetReceived => {
-                        self.orphan_beads.push(orphan_bead);
+                        // `add_bead` parks it again on the miss, so nothing to do.
                     }
                 }
             }
+
+            if !promoted_this_pass {
+                return promoted;
+            }
         }
-        promoted
     }
+
     pub fn resolve_parents(&self, bead: &Bead) -> Result<Vec<(u64, u32)>, BraidError> {
         bead.committed_metadata
             .parents
