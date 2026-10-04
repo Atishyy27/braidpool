@@ -489,3 +489,29 @@ fn test_committed_metadata_consensus_txid_order_is_significant() {
 
     assert_ne!(serialize(&metadata_ab), serialize(&metadata_ba));
 }
+
+/// A 92-byte response a local fuzz run produced against `BeadResponse::consensus_decode`.
+///
+/// Before the length bound, the `Vec::with_capacity(len)` in these decoders asked the
+/// allocator for 7,806,239,354,223,968 bytes and the process aborted. An abort is not a
+/// catchable panic, so a node reading this from a peer simply dies.
+#[test]
+fn test_a_fuzzer_found_response_is_refused_instead_of_aborting() {
+    use bitcoin::consensus::encode::Decodable;
+
+    const CRASH: &str = "00f304dddddddddddddddddddddddddddddddddddddddde0e0e0e0e0e0dd27e0\
+                         dde0ddddffff00003dddddddebebebebddebebebebebebebebeb00000000ebeb\
+                         ebebebebebebebebebebebebebebebebebebebebebebdddddddd00000204";
+    let bytes: Vec<u8> = (0..CRASH.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&CRASH[i..i + 2], 16).expect("hex"))
+        .collect();
+
+    let err = crate::bead::BeadResponse::consensus_decode(&mut &bytes[..])
+        .err()
+        .expect("this input must not decode");
+    assert!(
+        format!("{err:?}").contains("length exceeds the maximum a bead can carry"),
+        "refused for the wrong reason: {err:?}"
+    );
+}
