@@ -142,15 +142,47 @@ const HUGE_LEN: u64 = 0xdddd_dddd_dddd_dddd;
 #[test]
 fn test_timevec_decode_huge_length_prefix_errors_instead_of_panicking() {
     let bytes = serialize(&HUGE_LEN);
-    let result: Result<TimeVec, _> = deserialize(&bytes);
-    assert!(result.is_err());
+    let err = deserialize::<TimeVec>(&bytes).expect_err("a huge length must not decode");
+    // Asserting the reason, not just that something failed: without the bound this
+    // reaches the element loop and ends in UnexpectedEof instead.
+    assert!(
+        format!("{err:?}").contains("TimeVec length exceeds"),
+        "refused for the wrong reason: {err:?}"
+    );
 }
 
 #[test]
 fn test_txidvec_decode_huge_length_prefix_errors_instead_of_panicking() {
     let bytes = serialize(&HUGE_LEN);
-    let result: Result<TxIdVec, _> = deserialize(&bytes);
-    assert!(result.is_err());
+    let err = deserialize::<TxIdVec>(&bytes).expect_err("a huge length must not decode");
+    assert!(
+        format!("{err:?}").contains("TxIdVec length exceeds"),
+        "refused for the wrong reason: {err:?}"
+    );
+}
+
+/// The bound must sit above anything a real bead carries. A length at the limit
+/// is allowed through to the element reads, where it fails on input instead.
+#[test]
+fn test_a_length_at_the_bound_is_not_refused_by_the_bound() {
+    let at_cap = (MAX_VEC_SIZE / 4 / core::mem::size_of::<Txid>()) as u64;
+    let err = deserialize::<TxIdVec>(&serialize(&at_cap)).expect_err("no elements follow");
+    assert!(
+        !format!("{err:?}").contains("TxIdVec length exceeds"),
+        "the bound rejected a length it should accept: {err:?}"
+    );
+}
+
+#[test]
+fn test_vecs_within_the_bound_round_trip() {
+    let txids = TxIdVec(vec![
+        parse_txid("0000000000000000000000000000000000000000000000000000000000000001"),
+        parse_txid("0000000000000000000000000000000000000000000000000000000000000002"),
+    ]);
+    assert_eq!(deserialize::<TxIdVec>(&serialize(&txids)).unwrap(), txids);
+
+    let times = TimeVec(vec![Time::from_consensus(1_653_195_600).unwrap(); 3]);
+    assert_eq!(deserialize::<TimeVec>(&serialize(&times)).unwrap(), times);
 }
 
 #[test]

@@ -29,11 +29,19 @@ impl Encodable for TimeVec {
 impl Decodable for TimeVec {
     fn consensus_decode<R: Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
         let len = u64::consensus_decode(r)?;
-        // `len` comes from the peer. Cap the preallocation the same way
-        // rust-bitcoin's Vec<T> decoder does and let the loop fail on
-        // end-of-input, rather than trusting the prefix up front.
-        let max_capacity = MAX_VEC_SIZE / 4 / core::mem::size_of::<Time>();
-        let mut vec = Vec::with_capacity(core::cmp::min(len as usize, max_capacity));
+        // `len` comes from the peer, and the loop below reads that many elements,
+        // so clamping only the preallocation still lets a sender dictate the work.
+        // Use the same figure for both: a length we are unwilling to allocate for
+        // is a length we are unwilling to read. The bound is far above any real
+        // bead, which carries one timestamp per parent.
+        let max_len = MAX_VEC_SIZE / 4 / core::mem::size_of::<Time>();
+        if len as usize > max_len {
+            return Err(Error::from(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TimeVec length exceeds the maximum a bead can carry",
+            )));
+        }
+        let mut vec = Vec::with_capacity(len as usize);
         for _ in 0..len {
             let time_u32 = u32::consensus_decode(r)?;
             let time = Time::from_consensus(time_u32).unwrap();
@@ -57,9 +65,16 @@ impl Encodable for TxIdVec {
 impl Decodable for TxIdVec {
     fn consensus_decode<R: Read + ?Sized>(r: &mut R) -> Result<Self, Error> {
         let len = u64::consensus_decode(r)?;
-        // Same peer-supplied length cap as TimeVec above.
-        let max_capacity = MAX_VEC_SIZE / 4 / core::mem::size_of::<Txid>();
-        let mut vec = Vec::with_capacity(core::cmp::min(len as usize, max_capacity));
+        // Same peer-supplied length bound as TimeVec above. A Bitcoin block holds
+        // a few thousand transactions, so this leaves a wide margin.
+        let max_len = MAX_VEC_SIZE / 4 / core::mem::size_of::<Txid>();
+        if len as usize > max_len {
+            return Err(Error::from(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "TxIdVec length exceeds the maximum a bead can carry",
+            )));
+        }
+        let mut vec = Vec::with_capacity(len as usize);
         for _ in 0..len {
             vec.push(Txid::consensus_decode(r)?);
         }
