@@ -44,3 +44,9 @@ bench = false
 # Fuzzers need debug info for useful crash reports, but still optimised.
 [profile.release]
 debug = 1
+
+[[bin]]
+name = "bead_metadata_decode"
+path = "fuzz_targets/bead_metadata_decode.rs"
+test = false
+doc = false
