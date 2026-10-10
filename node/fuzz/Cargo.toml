@@ -50,3 +50,9 @@ name = "bead_metadata_decode"
 path = "fuzz_targets/bead_metadata_decode.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "bead_hashes_decode"
+path = "fuzz_targets/bead_hashes_decode.rs"
+test = false
+doc = false
