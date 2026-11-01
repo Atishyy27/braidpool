@@ -1,7 +1,13 @@
 import React, { useRef, useEffect, useState } from 'react';
 import * as d3 from 'd3';
-import { Loader } from 'lucide-react';
-import { GraphData, GraphNode, NodeIdMapping, BeadRecord } from './Types';
+import { Loader, WifiOff, AlertCircle } from 'lucide-react';
+import {
+  GraphData,
+  GraphNode,
+  NodeIdMapping,
+  BeadRecord,
+  BeadTooltipProps,
+} from './Types';
 import {
   layoutNodes,
   getEllipseEdgePoint,
@@ -10,29 +16,30 @@ import {
 import { WEBSOCKET_URLS } from '../../URLs';
 import {
   NODE_RADIUS,
-  PADDING,
   COLORS,
   MAX_BEADS_RECORDS,
   LINK_STROKE_WIDTH,
   ARROW_WIDTH,
   ARROW_HEIGHT,
+  CONTAINER_HEIGHT,
+  HIGHLIGHT_COLOR,
+  LINK_COLOR,
+  NODE_STROKE_COLOR,
 } from './Constants';
+import BeadTooltip from './BeadTooltip';
+import { shortenHash } from '../BeadsTab/lib/Utils';
 import { ChevronDown, ChevronUp } from 'lucide-react';
 
 const GraphVisualization: React.FC = () => {
   const svgRef = useRef<SVGSVGElement>(null);
-  const [graphData, setGraphData] = useState<GraphData | null>(null);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
   const [isPlaying, setIsPlaying] = useState(true);
   const isPlayingRef = useRef(true);
   const width = window.innerWidth - 100;
   const margin = { top: 0, right: 0, bottom: 0, left: 50 };
-  const [svgHeight, setSvgHeight] = useState(600);
   const [nodeIdMap, setNodeIdMap] = useState<NodeIdMapping>({});
-  const [selectedCohorts, setSelectedCohorts] = useState<number | 'all'>(5);
+  const [selectedCohorts, setSelectedCohorts] = useState<number | 'all'>(20);
   const nodeRadius = NODE_RADIUS;
-  const tooltipRef = useRef<HTMLDivElement>(null);
+  const [hoveredBead, setHoveredBead] = useState<BeadTooltipProps | null>(null);
 
   const [graphUpdateCounter, setGraphUpdateCounter] = useState(0);
   const [latestBeadHashForHighlight, setLatestBeadHashForHighlight] = useState<
@@ -41,7 +48,6 @@ const GraphVisualization: React.FC = () => {
 
   const prevFirstCohortRef = useRef<string[]>([]);
   const prevLastCohortRef = useRef<string[]>([]);
-  const [_connectionStatus, setConnectionStatus] = useState('Disconnected');
 
   const [totalBeads, setTotalBeads] = useState<number>(0);
   const [totalCohorts, setTotalCohorts] = useState<number>(0);
@@ -57,7 +63,247 @@ const GraphVisualization: React.FC = () => {
   const [consecutiveZoomInCount, setConsecutiveZoomInCount] = useState(0);
   const [consecutiveZoomOutCount, setConsecutiveZoomOutCount] = useState(0);
 
+  const hasInitializedTableRef = useRef(false);
+
+  const selectedCohortsRef = useRef<number | 'all'>(selectedCohorts);
+  const loadDAGRef = useRef<(() => Promise<void>) | null>(null);
+
   const [beadRecords, setBeadRecords] = useState<BeadRecord[]>([]);
+
+  const [graphData, setGraphData] = useState<GraphData | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [connectionStatus, setConnectionStatus] = useState<
+    'connecting' | 'connected' | 'disconnected' | 'error'
+  >('connecting');
+  const [nodeBraidInfo, setNodeBraidInfo] = useState<{
+    bead_count: number;
+    cohort_count: number;
+  } | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    let ws: WebSocket;
+    let reqId = 0;
+    let reconnectDelay = 1_000;
+    let hasLoaded = false;
+    let fetchGen = 0;
+    const RPC_TIMEOUT_MS = 15_000;
+    const pending = new Map<
+      number,
+      {
+        resolve: (v: unknown) => void;
+        reject: (e: Error) => void;
+        timer: ReturnType<typeof setTimeout>;
+      }
+    >();
+
+    function rpc(method: string, params: unknown[] = []): Promise<unknown> {
+      return new Promise((resolve, reject) => {
+        const id = ++reqId;
+        const timer = setTimeout(() => {
+          pending.delete(id);
+          reject(new Error(`RPC timeout: ${method}`));
+        }, RPC_TIMEOUT_MS);
+        pending.set(id, { resolve, reject, timer });
+        try {
+          ws.send(JSON.stringify({ jsonrpc: '2.0', id, method, params }));
+        } catch (e) {
+          clearTimeout(timer);
+          pending.delete(id);
+          reject(e);
+        }
+      });
+    }
+
+    async function loadDAG() {
+      const myGen = ++fetchGen;
+      const sel = selectedCohortsRef.current;
+      try {
+        const rawBraidInfo = await rpc('getbraidinfo');
+
+        const bi = rawBraidInfo as {
+          bead_count: number;
+          cohort_count: number;
+          total_work: string;
+          tip_count: number;
+        };
+        if (mounted) setNodeBraidInfo(bi);
+
+        const cohortCount = bi.cohort_count ?? 0;
+
+        if (cohortCount === 0) {
+          if (mounted && fetchGen === myGen) {
+            setGraphData({
+              cohorts: [],
+              parents: {},
+              children: {},
+              highest_work_path: [],
+              bead_count: bi.bead_count,
+            });
+            setLoading(false);
+            hasLoaded = true;
+          }
+          return;
+        }
+
+        // 'all' → fetch every cohort; number → fetch the last N.
+        const numToFetch =
+          sel === 'all' ? cohortCount : Math.min(sel, cohortCount);
+        const startCohort = Math.max(0, cohortCount - numToFetch);
+        const cohorts = (await Promise.all(
+          Array.from({ length: cohortCount - startCohort }, (_, i) =>
+            rpc('getcohortbyid', [startCohort + i]).catch((e) => {
+              console.warn(
+                `[BraidPoolDAG] getcohortbyid(${startCohort + i}) failed:`,
+                e
+              );
+              return [];
+            })
+          )
+        )) as string[][];
+
+        const allBeads = cohorts.flat();
+
+        const parentEntries = await Promise.all(
+          allBeads.map((hash) =>
+            rpc('getparents', [hash])
+              .then((p) => [hash, p as string[]] as const)
+              .catch(() => [hash, [] as string[]] as const)
+          )
+        );
+
+        const parents = Object.fromEntries(parentEntries);
+        const children: Record<string, string[]> = {};
+        for (const [hash, ps] of parentEntries) {
+          for (const p of ps) {
+            (children[p] ??= []).push(hash);
+          }
+        }
+        const loadedBeadSet = new Set(allBeads);
+        const rawHwp = (await rpc('gethighestworkpathbycount', [
+          numToFetch,
+        ]).catch((e) => {
+          console.warn('[BraidPoolDAG] gethighestworkpathbycount failed:', e);
+          return [] as string[];
+        })) as string[];
+        const hwp = rawHwp.filter((h) => loadedBeadSet.has(h));
+
+        if (!mounted || fetchGen !== myGen) return;
+        console.log(
+          `[BraidPoolDAG] ready: ${allBeads.length} beads across ${cohorts.length} cohorts (node total: ${bi.bead_count})`
+        );
+        setGraphData({
+          cohorts,
+          parents,
+          children,
+          highest_work_path: hwp,
+          bead_count: bi.bead_count,
+        });
+        setLoading(false);
+        setError(null);
+        hasLoaded = true;
+      } catch (err) {
+        if (!mounted || fetchGen !== myGen) return;
+        console.error('[BraidPoolDAG] loadDAG failed:', err);
+        setError(`Failed to load DAG data from node: ${err}`);
+        setLoading(false);
+      }
+    }
+
+    // Expose so other effects can trigger a re-fetch when selection changes.
+    loadDAGRef.current = loadDAG;
+
+    function connect() {
+      if (!mounted) return;
+      setConnectionStatus('connecting');
+      ws = new WebSocket(WEBSOCKET_URLS.NODE_RPC_WS);
+
+      ws.onopen = () => {
+        if (!mounted) return;
+        reconnectDelay = 1_000;
+        setConnectionStatus('connected');
+        loadDAG();
+        const subId = ++reqId;
+        const subTimer = setTimeout(
+          () => pending.delete(subId),
+          RPC_TIMEOUT_MS
+        );
+        pending.set(subId, {
+          resolve: () => {
+            clearTimeout(subTimer);
+          },
+          reject: () => {
+            clearTimeout(subTimer);
+          },
+          timer: subTimer,
+        });
+        ws.send(
+          JSON.stringify({
+            jsonrpc: '2.0',
+            id: subId,
+            method: 'subscribebead',
+            params: [],
+          })
+        );
+      };
+
+      ws.onmessage = ({ data }: MessageEvent<string>) => {
+        if (!mounted) return;
+        let msg: Record<string, unknown>;
+        try {
+          msg = JSON.parse(data) as Record<string, unknown>;
+        } catch {
+          return;
+        }
+        if (msg.id != null) {
+          const p = pending.get(msg.id as number);
+          if (p) {
+            clearTimeout(p.timer);
+            pending.delete(msg.id as number);
+            if (msg.error) p.reject(new Error(JSON.stringify(msg.error)));
+            else p.resolve(msg.result);
+          }
+          return;
+        }
+        const params = msg.params as Record<string, unknown> | undefined;
+        if (msg.method === 'subscribebead' && params?.result != null) {
+          if (isPlayingRef.current) loadDAG();
+        }
+      };
+
+      ws.onerror = (e) => {
+        console.error('[BraidPoolDAG] WebSocket error:', e);
+        if (mounted) setConnectionStatus('error');
+      };
+
+      ws.onclose = (e) => {
+        if (!mounted) return;
+        console.warn(`[BraidPoolDAG] disconnected (code ${e.code})`);
+        setConnectionStatus('disconnected');
+        pending.forEach(({ reject, timer }) => {
+          clearTimeout(timer);
+          reject(new Error('WebSocket closed'));
+        });
+        pending.clear();
+        if (!hasLoaded) {
+          setLoading(false);
+          setError(`Cannot reach node at ${WEBSOCKET_URLS.NODE_RPC_WS}. `);
+        }
+        setTimeout(connect, reconnectDelay);
+        reconnectDelay = Math.min(reconnectDelay * 2, 30_000);
+      };
+    }
+
+    connect();
+    return () => {
+      mounted = false;
+      if (ws) {
+        ws.onclose = null;
+        ws.close();
+      }
+    };
+  }, []);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const toggleRowExpansion = (hash: string) => {
     setExpandedRows((prev) => {
@@ -99,202 +345,138 @@ const GraphVisualization: React.FC = () => {
   }, []);
 
   useEffect(() => {
-    const url = WEBSOCKET_URLS.BRAIDPOOL_DAG_WEBSOCKET;
-    const socket = new WebSocket(url);
-    let isMounted = true;
+    if (!graphData) return;
 
-    socket.onopen = () => {
-      if (!isMounted) return;
-      console.log('Connected to WebSocket', url);
-      setConnectionStatus('Connected');
-    };
+    const firstCohortChanged =
+      graphData.cohorts?.[0]?.length > 0 &&
+      JSON.stringify(prevFirstCohortRef.current) !==
+        JSON.stringify(graphData.cohorts[0]);
 
-    socket.onclose = () => {
-      if (!isMounted) return;
-      setConnectionStatus('Disconnected');
-    };
+    const lastCohortChanged =
+      graphData.cohorts.length > 0 &&
+      JSON.stringify(prevLastCohortRef.current) !==
+        JSON.stringify(graphData.cohorts[graphData.cohorts.length - 1]);
 
-    socket.onerror = (err) => {
-      if (!isMounted) return;
-      setConnectionStatus(`Error: ${err}`);
-    };
+    if (firstCohortChanged) {
+      const top = COLORS.shift();
+      COLORS.push(top ?? `rgba(${217}, ${95}, ${2}, 1)`);
+      prevFirstCohortRef.current = graphData.cohorts[0];
+    }
 
-    socket.onmessage = (event) => {
-      if (!isMounted) return;
-      try {
-        const parsed = JSON.parse(event.data);
-        const parsedData = parsed.data;
-        console.log('Received data:', parsedData);
-        if (!isPlayingRef.current) {
-          return;
-        }
-        if (!parsedData?.parents || typeof parsedData.parents !== 'object') {
-          return;
-        }
+    if (lastCohortChanged) {
+      prevLastCohortRef.current =
+        graphData.cohorts[graphData.cohorts.length - 1];
+    }
 
-        const children: Record<string, string[]> = {};
-        if (parsedData?.parents && typeof parsedData.parents === 'object') {
-          Object.entries(parsedData.parents).forEach(([nodeId, parents]) => {
-            (parents as string[]).forEach((parentId) => {
-              if (!children[parentId]) {
-                children[parentId] = [];
-              }
-              children[parentId].push(nodeId);
-            });
+    const newMapping: NodeIdMapping = {};
+    let nextId = 1;
+    Object.keys(graphData.parents).forEach((hash) => {
+      if (!newMapping[hash]) {
+        newMapping[hash] = nextId.toString();
+        nextId++;
+      }
+    });
+    setNodeIdMap(newMapping);
+
+    // Track new beads for the table
+    const hwPathSet = new Set(graphData.highest_work_path);
+    const newBeads: BeadRecord[] = [];
+
+    if (!hasInitializedTableRef.current && graphData.cohorts.length > 0) {
+      hasInitializedTableRef.current = true;
+      graphData.cohorts.forEach((cohort, cohortIndex) => {
+        cohort.forEach((beadHash: string) => {
+          const parentHashes = graphData.parents[beadHash] || [];
+          const childHashes = graphData.children[beadHash] || [];
+          newBeads.push({
+            hash: beadHash,
+            parentHashes,
+            parentCount: parentHashes.length,
+            childHashes,
+            childCount: childHashes.length,
+            isHWP: hwPathSet.has(beadHash),
+            timestamp: new Date().toLocaleTimeString(),
+            cohortIndex,
           });
-        }
-
-        const bead_count =
-          parsedData?.parents && typeof parsedData.parents === 'object'
-            ? Object.keys(parsedData.parents).length
-            : 0;
-
-        const graphData: GraphData = {
-          highest_work_path: parsedData.highest_work_path,
-          parents: parsedData.parents,
-          cohorts: parsedData.cohorts,
-          children,
-          bead_count,
-        };
-
-        const firstCohortChanged =
-          parsedData?.cohorts?.[0]?.length &&
-          JSON.stringify(prevFirstCohortRef.current) !==
-            JSON.stringify(parsedData.cohorts[0]);
-
-        const lastCohortChanged =
-          parsedData?.cohorts?.length > 0 &&
-          JSON.stringify(prevLastCohortRef.current) !==
-            JSON.stringify(parsedData.cohorts[parsedData.cohorts.length - 1]);
-
-        if (firstCohortChanged) {
-          const top = COLORS.shift();
-          COLORS.push(top ?? `rgba(${217}, ${95}, ${2}, 1)`);
-          prevFirstCohortRef.current = parsedData.cohorts[0];
-        }
-
-        if (lastCohortChanged) {
-          prevLastCohortRef.current =
-            parsedData.cohorts[parsedData.cohorts.length - 1];
-        }
-
-        const newMapping: NodeIdMapping = {};
-        let nextId = 1;
-        Object.keys(parsedData.parents).forEach((hash) => {
-          if (!newMapping[hash]) {
-            newMapping[hash] = nextId.toString();
-            nextId++;
-          }
         });
+      });
 
-        setNodeIdMap(newMapping);
-        setGraphData(graphData);
-
-        // Track new beads for the table
-        const hwPathSet = new Set(parsedData.highest_work_path);
-        const newBeads: BeadRecord[] = [];
-
-        if (lastCohortChanged && parsedData?.cohorts?.length > 0) {
-          const lastCohort = parsedData.cohorts[parsedData.cohorts.length - 1];
-          lastCohort.forEach((beadHash: string) => {
-            const parents = parsedData.parents[beadHash] || [];
-            const childrenList = children[beadHash] || [];
-            const cohortIndex = parsedData.cohorts.findIndex((c: string[]) =>
-              c.includes(beadHash)
-            );
-
-            newBeads.push({
-              hash: beadHash,
-              parentHashes: parents,
-              parentCount: parents.length,
-              childHashes: childrenList,
-              childCount: childrenList.length,
-              isHWP: hwPathSet.has(beadHash),
-              timestamp: new Date().toLocaleTimeString(),
-              cohortIndex: cohortIndex,
-            });
-          });
-
-          if (newBeads.length > 0) {
-            setBeadRecords((prev) => {
-              const updated = [...newBeads, ...prev];
-              return updated.slice(0, MAX_BEADS_RECORDS);
-            });
-          }
-        }
-
-        // Increment the counter and update the highlighted bead hash
-        setGraphUpdateCounter((prevCounter) => {
-          const newCounter = prevCounter + 1;
-          // If the counter is divisible by 100, set the latest bead's hash
-          if (
-            newCounter % 100 === 0 &&
-            parsedData.highest_work_path.length > 0
-          ) {
-            const latestBeadHash =
-              parsedData.highest_work_path[
-                parsedData.highest_work_path.length - 1
-              ];
-            setLatestBeadHashForHighlight(latestBeadHash);
-          }
-          // The `latestBeadHashForHighlight` will remain set until the next time the condition is met.
-          return newCounter;
-        });
-
-        setTotalBeads(bead_count);
-        setTotalCohorts(parsedData.cohorts.length);
-        setMaxCohortSize(
-          Math.max(...parsedData.cohorts.map((c: string | any[]) => c.length))
+      setBeadRecords(newBeads.reverse().slice(0, MAX_BEADS_RECORDS));
+    } else if (lastCohortChanged && graphData.cohorts.length > 0) {
+      const lastCohort = graphData.cohorts[graphData.cohorts.length - 1];
+      lastCohort.forEach((beadHash: string) => {
+        const parentHashes = graphData.parents[beadHash] || [];
+        const childHashes = graphData.children[beadHash] || [];
+        const cohortIndex = graphData.cohorts.findIndex((c) =>
+          c.includes(beadHash)
         );
-        setHwpLength(parsedData.highest_work_path.length);
-        setLoading(false);
-
-        // Trigger animation if cohorts changed
-        if (firstCohortChanged || lastCohortChanged) {
-          if (!isPlayingRef.current) {
-            return;
-          }
-          setTimeout(() => {
-            animateCohorts(
-              firstCohortChanged ? parsedData.cohorts[0] : [],
-              lastCohortChanged
-                ? parsedData.cohorts[parsedData.cohorts.length - 1]
-                : []
-            );
-          }, 100);
-        }
-      } catch (err) {
-        setError('Error processing graph data: ');
-        console.error('Error processing graph data:', err);
-        setLoading(false);
+        newBeads.push({
+          hash: beadHash,
+          parentHashes,
+          parentCount: parentHashes.length,
+          childHashes,
+          childCount: childHashes.length,
+          isHWP: hwPathSet.has(beadHash),
+          timestamp: new Date().toLocaleTimeString(),
+          cohortIndex,
+        });
+      });
+      if (newBeads.length > 0) {
+        setBeadRecords((prev) => {
+          const updated = [...newBeads, ...prev];
+          return updated.slice(0, MAX_BEADS_RECORDS);
+        });
       }
-    };
+    }
 
-    return () => {
-      isMounted = false;
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.close();
+    setGraphUpdateCounter((prevCounter) => {
+      const newCounter = prevCounter + 1;
+      if (
+        (newCounter === 1 || newCounter % 5 === 0) &&
+        graphData.highest_work_path.length > 0
+      ) {
+        setLatestBeadHashForHighlight(
+          graphData.highest_work_path[graphData.highest_work_path.length - 1]
+        );
       }
-    };
-  }, []);
+      return newCounter;
+    });
+    setTotalBeads(nodeBraidInfo?.bead_count ?? graphData.bead_count);
+    setTotalCohorts(nodeBraidInfo?.cohort_count ?? graphData.cohorts.length);
+    setMaxCohortSize(
+      graphData.cohorts.length > 0
+        ? Math.max(...graphData.cohorts.map((c) => c.length))
+        : 0
+    );
+    setHwpLength(graphData.highest_work_path.length);
 
+    if (firstCohortChanged || lastCohortChanged) {
+      setTimeout(() => {
+        animateCohorts(
+          [],
+          lastCohortChanged
+            ? graphData.cohorts[graphData.cohorts.length - 1]
+            : []
+        );
+      }, 100);
+    }
+  }, [graphData, nodeBraidInfo]);
   const animateCohorts = (firstCohort: string[], lastCohort: string[]) => {
     if (!svgRef.current) return;
 
     const svg = d3.select(svgRef.current);
 
-    // Animate first cohort nodes
     if (firstCohort.length > 0) {
       svg
         .selectAll('.node')
         .filter((d: any) => firstCohort.includes(d.id))
-        .select('ellipse')
-        .attr('stroke', '#FF8500')
+        .select('ellipse , rect')
+        .attr('stroke', HIGHLIGHT_COLOR)
         .attr('stroke-width', 3)
         .transition()
         .duration(1000)
         .attr('stroke-width', 2)
-        .attr('stroke', '#fff');
+        .attr('stroke', NODE_STROKE_COLOR);
     }
 
     // Animate last cohort nodes
@@ -302,13 +484,13 @@ const GraphVisualization: React.FC = () => {
       svg
         .selectAll('.node')
         .filter((d: any) => lastCohort.includes(d.id))
-        .select('ellipse')
-        .attr('stroke', '#FF8500')
+        .select('ellipse , rect')
+        .attr('stroke', HIGHLIGHT_COLOR)
         .attr('stroke-width', 3)
         .transition()
         .duration(1000)
         .attr('stroke-width', 2)
-        .attr('stroke', '#fff');
+        .attr('stroke', NODE_STROKE_COLOR);
     }
 
     if (firstCohort.length > 0) {
@@ -319,7 +501,7 @@ const GraphVisualization: React.FC = () => {
             firstCohort.includes(d.source) || firstCohort.includes(d.target)
         )
         .attr('stroke-width', 2)
-        .attr('stroke', '#FF8500');
+        .attr('stroke', HIGHLIGHT_COLOR);
 
       animateLinkDirection(selectedLinks);
     }
@@ -333,7 +515,7 @@ const GraphVisualization: React.FC = () => {
             lastCohort.includes(d.source) || lastCohort.includes(d.target)
         )
         .attr('stroke-width', 2)
-        .attr('stroke', '#FF8500');
+        .attr('stroke', HIGHLIGHT_COLOR);
 
       animateLinkDirection(selectedLinks);
     }
@@ -345,12 +527,18 @@ const GraphVisualization: React.FC = () => {
     const currentY = currentTransform ? currentTransform.y : 0;
     return d3.zoomIdentity.translate(currentX, currentY).scale(nextZoom);
   };
+  useEffect(() => {
+    selectedCohortsRef.current = selectedCohorts;
+    hasInitializedTableRef.current = false;
+    setBeadRecords([]);
+    loadDAGRef.current?.();
+    zoomTransformRef.current = null;
+  }, [selectedCohorts]);
 
   const handleResetZoom = () => {
     const nextZoom = 0.3;
     setDefaultZoom(nextZoom);
-    zoomTransformRef.current = buildZoomTransform(nextZoom);
-
+    zoomTransformRef.current = null;
     setConsecutiveZoomInCount(0);
     setConsecutiveZoomOutCount(0);
   };
@@ -385,61 +573,88 @@ const GraphVisualization: React.FC = () => {
 
   useEffect(() => {
     if (!svgRef.current || !graphData) return;
-    const filteredCohorts = graphData.cohorts.slice(-selectedCohorts);
+    const containerWidth = svgRef.current.parentElement?.clientWidth ?? width;
+    svgRef.current.setAttribute('width', String(containerWidth));
+
+    const filteredCohorts =
+      selectedCohorts === 'all'
+        ? graphData.cohorts
+        : graphData.cohorts.slice(-selectedCohorts);
     const filteredCohortNodes = new Set(filteredCohorts.flat());
 
-    const tooltip = d3.select(tooltipRef.current).style('visibility', 'hidden');
+    setHoveredBead(null);
 
     const svg = d3.select(svgRef.current);
     svg.selectAll('*').remove();
 
     const container = svg.append('g');
 
+    const allNodes = Object.keys(graphData.parents).map((id) => ({
+      id,
+      parents: graphData.parents[id],
+      children: graphData.children[id] ?? [],
+    }));
+
+    const hwPath = graphData.highest_work_path;
+    const cohorts = graphData.cohorts;
+    const positions = layoutNodes(
+      allNodes,
+      hwPath,
+      {},
+      CONTAINER_HEIGHT,
+      {},
+      margin
+    );
+    const hwPathSet = new Set(hwPath);
+
+    const visibleNodes = allNodes.filter((node) =>
+      filteredCohortNodes.has(node.id)
+    );
+    let minVisibleX = Infinity;
+    let maxVisibleX = -Infinity;
+    visibleNodes.forEach((node) => {
+      const x = positions[node.id]?.x ?? 0;
+      if (x < minVisibleX) minVisibleX = x;
+      if (x > maxVisibleX) maxVisibleX = x;
+    });
+    if (!isFinite(minVisibleX)) minVisibleX = margin.left;
+    if (!isFinite(maxVisibleX)) maxVisibleX = margin.left;
+    const offsetX = margin.left - minVisibleX;
+
     zoomBehavior.current = d3
       .zoom<SVGSVGElement, unknown>()
-      .scaleExtent([0.5, 5])
+      .scaleExtent([0.1, 5])
       .on('zoom', (event: d3.D3ZoomEvent<SVGSVGElement, unknown>) => {
         container.attr('transform', event.transform.toString());
-        zoomTransformRef.current = event.transform;
+        if (event.sourceEvent) {
+          zoomTransformRef.current = event.transform;
+        }
       });
+    const scale = defaultZoom;
+    const rightPad = 80;
+    const visibleSpanScaled =
+      (maxVisibleX - minVisibleX + 2 * (nodeRadius + 10)) * scale;
+    let autoTx: number;
+    if (visibleSpanScaled + rightPad < containerWidth) {
+      const contentCenterX = (minVisibleX + maxVisibleX) / 2 + offsetX;
+      autoTx = containerWidth / 2 - contentCenterX * scale;
+    } else {
+      autoTx =
+        containerWidth -
+        rightPad -
+        (maxVisibleX + offsetX + nodeRadius + 10) * scale;
+    }
+    const autoTy = CONTAINER_HEIGHT / 2 - (CONTAINER_HEIGHT / 2) * scale - 60;
+    const autoTransform = d3.zoomIdentity
+      .translate(autoTx, autoTy)
+      .scale(scale);
 
     svg
       .call(zoomBehavior.current)
       .call(
         zoomBehavior.current.transform,
-        zoomTransformRef.current ??
-          d3.zoomIdentity.translate(0, 50).scale(defaultZoom)
+        zoomTransformRef.current ?? autoTransform
       );
-
-    const allNodes = Object.keys(graphData.parents).map((id) => ({
-      id,
-      parents: graphData.parents[id],
-      children: graphData.children[id],
-    }));
-
-    const hwPath = graphData.highest_work_path;
-    const cohorts = graphData.cohorts;
-    const positions = layoutNodes(allNodes, hwPath, {}, svgHeight, {}, margin);
-    const hwPathSet = new Set(hwPath);
-
-    // Calculate required height based on node positions
-    const allY = Object.values(positions).map((pos) => pos.y);
-    const minY = Math.min(...allY);
-    const maxY = Math.max(...allY);
-    const padding = PADDING * 2; // Additional padding top and bottom
-    const dynamicHeight = maxY - minY + padding;
-    setSvgHeight(dynamicHeight);
-
-    // making old nodes invisible
-    const visibleNodes = allNodes.filter((node) =>
-      filteredCohortNodes.has(node.id)
-    );
-    let minVisibleX = Infinity;
-    visibleNodes.forEach((node) => {
-      const x = positions[node.id]?.x || 0;
-      if (x < minVisibleX) minVisibleX = x;
-    });
-    const offsetX = margin.left - minVisibleX;
 
     const links: { source: string; target: string }[] = [];
     allNodes.forEach((node) => {
@@ -547,8 +762,8 @@ const GraphVisualization: React.FC = () => {
       })
       .attr('stroke', (d) =>
         hwPathSet.has(d.source) && hwPathSet.has(d.target)
-          ? '#FF8500'
-          : '#48CAE4'
+          ? HIGHLIGHT_COLOR
+          : LINK_COLOR
       )
       .attr('stroke-width', LINK_STROKE_WIDTH)
       .attr('marker-end', (d) =>
@@ -581,7 +796,7 @@ const GraphVisualization: React.FC = () => {
             .attr('rx', 5) // rounded corners
             .attr('ry', 5)
             .attr('fill', 'red') // Red for the highlighted bead
-            .attr('stroke', '#fff')
+            .attr('stroke', NODE_STROKE_COLOR)
             .attr('stroke-width', 2);
         } else {
           nodeSelection
@@ -594,22 +809,22 @@ const GraphVisualization: React.FC = () => {
               if (cohortIndex === undefined) return COLORS[0];
               return COLORS[cohortIndex % COLORS.length];
             })
-            .attr('stroke', '#fff')
+            .attr('stroke', NODE_STROKE_COLOR)
             .attr('stroke-width', 2);
         }
       })
       .on('mouseover', function (event: MouseEvent, d: GraphNode) {
         d3.select(this)
           .select('ellipse, rect')
-          .attr('stroke', '#FF8500')
+          .attr('stroke', HIGHLIGHT_COLOR)
           .attr('stroke-width', 3);
       })
       .on('mouseout', function () {
         d3.select(this)
           .select('ellipse, rect')
-          .attr('stroke', '#fff')
+          .attr('stroke', NODE_STROKE_COLOR)
           .attr('stroke-width', 2);
-        tooltip.style('visibility', 'hidden');
+        setHoveredBead(null);
       });
 
     nodes
@@ -618,75 +833,17 @@ const GraphVisualization: React.FC = () => {
       .attr('text-anchor', 'middle')
       .text((d) => `${d.id.slice(-4)}`)
       .attr('fill', '#fff')
-      .style('font-size', 40)
+      .style('font-size', 55)
       .style('font-weight', 'bold')
       .on('mouseover', function (event: MouseEvent, d: GraphNode) {
         const cohortIndex = cohortMap.get(d.id);
-        const isHWP = hwPathSet.has(d.id);
-        const hwpPosition = isHWP ? hwPath.indexOf(d.id) + 1 : null;
-
-        const tooltipContent = `
-                <div style="max-width: 400px; font-size: 12px; line-height: 1.6;">
-                  <div style="margin-bottom: 8px; padding-bottom: 8px;">
-                    <strong >Bead Information</strong>
-                  </div>
-                  
-                  <div style="margin-bottom: 4px; word-break: break-all;"><strong> Hash:</strong> <span style="font-family: monospace; font-size: 10px;">${d.id}</span></div>
-                  <div style="margin-bottom: 4px;"><strong>Cohort Index:</strong> ${cohortIndex !== undefined ? cohortIndex : 'N/A'}</div>
-                  <div style="margin-bottom: 4px;"><strong>On HWP:</strong> <span style="color: ${isHWP ? '#4ade80' : '#ef4444'};">${isHWP ? 'Yes' : 'No'}${hwpPosition ? ` (Position: ${hwpPosition})` : ''}</span></div>
-                  
-                  <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #48CAE4;">
-                    <strong>Parents (${d.parents.length}):</strong>
-                    ${
-                      d.parents.length > 0
-                        ? `
-                      <div style="margin-top: 4px; padding-left: 8px;">
-                        ${d.parents
-                          .map(
-                            (p) => `
-                          <div style="margin: 2px 0; font-size: 10px;">
-                            <span style="color: #FF8500;">→</span>
-                            <span style="font-family: monospace; color: #48CAE4;">${p.slice(0, 12)}...${p.slice(-8)}</span>
-                          </div>
-                        `
-                          )
-                          .join('')}
-                      </div>
-                    `
-                        : '<span style="color: #999;"> None (Genesis)</span>'
-                    }
-                  </div>
-                  
-                  <div style="margin-top: 8px; padding-top: 8px; border-top: 1px solid #48CAE4;">
-                    <strong>Children (${d.children?.length || 0}):</strong>
-                    ${
-                      d.children && d.children.length > 0
-                        ? `
-                      <div style="margin-top: 4px; padding-left: 8px;">
-                        ${d.children
-                          .slice(0, 5)
-                          .map(
-                            (c) => `
-                          <div style="margin: 2px 0; font-size: 10px;">
-                            <span style="color: #4ade80;">→</span> 
-                            <span style="font-family: monospace; color: #48CAE4;">${c.slice(0, 12)}...${c.slice(-8)}</span>
-                          </div>
-                        `
-                          )
-                          .join('')}
-                        ${d.children.length > 5 ? `<div style="margin-top: 2px; color: #999; font-size: 10px;">... and ${d.children.length - 5} more</div>` : ''}
-                      </div>
-                    `
-                        : '<span style="color: #999;"> None (Leaf bead)</span>'
-                    }
-                  </div>
-                </div>
-                  `;
-
-        tooltip.html(tooltipContent).style('visibility', 'visible');
+        const hwpPosition = hwPathSet.has(d.id)
+          ? hwPath.indexOf(d.id) + 1
+          : null;
+        setHoveredBead({ bead: d, cohortIndex, hwpPosition });
       })
       .on('mouseout', function () {
-        tooltip.style('visibility', 'hidden');
+        setHoveredBead(null);
       });
     container
       .append('text')
@@ -699,8 +856,8 @@ const GraphVisualization: React.FC = () => {
       .append('defs')
       .selectAll('marker')
       .data([
-        { id: 'arrow-blue', color: '#48CAE4' },
-        { id: 'arrow-orange', color: '#FF8500' },
+        { id: 'arrow-blue', color: LINK_COLOR },
+        { id: 'arrow-orange', color: HIGHLIGHT_COLOR },
       ])
       .enter()
       .append('marker')
@@ -722,47 +879,62 @@ const GraphVisualization: React.FC = () => {
     latestBeadHashForHighlight,
   ]);
 
-  if (loading) {
+  if (loading && !graphData) {
     return (
       <div className="flex items-center justify-center h-full w-full">
         <div className="flex flex-col items-center">
           <Loader className="h-8 w-8 text-[#0077B6] animate-spin" />
-          <p className="mt-4 text-[#0077B6]">Loading graph data...</p>
+          <p className="mt-4 text-[#0077B6]">
+            {connectionStatus === 'connecting'
+              ? 'Connecting to node…'
+              : 'Loading DAG data…'}
+          </p>
+          <p className="mt-1 text-xs text-gray-500">
+            {WEBSOCKET_URLS.NODE_RPC_WS}
+          </p>
         </div>
       </div>
     );
   }
 
-  if (error) {
+  if (error && !graphData) {
     return (
-      <div className="flex flex-col items-center justify-center h-screen">
-        <div className="text-red-500 mb-4">Error: {error}</div>
-        <button
-          onClick={() => window.location.reload()}
-          className="bg-[#0077B6] text-white px-4 py-2 rounded hover:bg-[#005691] transition-colors"
-        >
-          Retry
-        </button>
+      <div className="flex flex-col items-center justify-center h-screen gap-3">
+        <AlertCircle className="h-10 w-10 text-red-500" />
+        <div className="text-red-400 text-sm max-w-sm text-center">{error}</div>
+        <p className="text-xs text-gray-500">
+          Make sure the node is running at{' '}
+          <code className="font-mono">{WEBSOCKET_URLS.NODE_RPC_WS}</code>
+        </p>
       </div>
     );
   }
 
   if (!graphData) {
     return (
-      <div className="flex flex-col items-center justify-center h-screen">
-        <div className="text-[#0077B6] mb-4">No graph data available</div>
-        <button
-          onClick={() => window.location.reload()}
-          className="bg-[#0077B6] text-white px-4 py-2 rounded hover:bg-[#005691] transition-colors"
-        >
-          Refresh
-        </button>
+      <div className="flex flex-col items-center justify-center h-screen gap-3">
+        <WifiOff className="h-10 w-10 text-gray-500" />
+        <div className="text-gray-400">Waiting for node data…</div>
       </div>
     );
   }
 
+  const connectionBanner =
+    connectionStatus === 'disconnected' || connectionStatus === 'error' ? (
+      <div className="flex items-center gap-2 px-3 py-1.5 border  rounded  text-xs">
+        <WifiOff className="h-3.5 w-3.5 shrink-0" />
+        <span>Node disconnected showing last known state. Reconnecting…</span>
+      </div>
+    ) : connectionStatus === 'connecting' ? (
+      <div className="flex items-center gap-2 px-3 py-1.5 bg-blue-900/40 border border-blue-600 rounded text-blue-300 text-xs">
+        <Loader className="h-3.5 w-3.5 animate-spin shrink-0" />
+        <span>Connecting to node…</span>
+      </div>
+    ) : null;
+
   return (
     <div>
+      {connectionBanner && <div className="mx-2 mt-2">{connectionBanner}</div>}
       <div>
         <div className=" h-[650px] border border-gray-600 backdrop-blur-2xl  rounded-lg  shadow-lg overflow-hidden mt-2">
           <div className="m-2 relative flex gap-2 items-center">
@@ -775,7 +947,7 @@ const GraphVisualization: React.FC = () => {
               className="px-2 py-1 rounded border border-[#0077B6]  text-[#0077B6]"
             >
               <option value="all">Show all cohorts</option>
-              {[1, 2, 3, 4, 5].map((value) => (
+              {[5, 10, 15, 20].map((value) => (
                 <option key={value} value={value}>
                   Show latest {value} cohorts
                 </option>
@@ -786,13 +958,13 @@ const GraphVisualization: React.FC = () => {
                 <div className="font-medium text-[#0077B6]">
                   Total Beads:{' '}
                   <span className="font-normal text-[#FF8500]">
-                    {totalBeads}
+                    {totalBeads.toLocaleString()}
                   </span>
                 </div>
                 <div className="font-medium text-[#0077B6]">
                   Total Cohorts:{' '}
                   <span className="font-normal text-[#FF8500]">
-                    {totalCohorts}
+                    {totalCohorts.toLocaleString()}
                   </span>
                 </div>
                 <div className="font-medium text-[#0077B6]">
@@ -802,7 +974,7 @@ const GraphVisualization: React.FC = () => {
                   </span>
                 </div>
                 <div className="font-medium text-[#0077B6]">
-                  HWP Length:{' '}
+                  HWP (window):{' '}
                   <span className="font-normal text-[#FF8500]">
                     {hwpLength}
                   </span>
@@ -859,13 +1031,15 @@ const GraphVisualization: React.FC = () => {
           <svg
             ref={svgRef}
             width={width}
-            height={svgHeight}
+            height={CONTAINER_HEIGHT}
+            overflow="visible"
             className="block"
           />
-          <div
-            ref={tooltipRef}
-            className="fixed bg-gray-800 text-white border rounded p-2 shadow-lg pointer-events-none z-10 bottom-5 right-5 mb-[200px] border-gray-600 backdrop-blur-lg"
-          ></div>
+          {hoveredBead && (
+            <div className="fixed bg-gray-800 text-white border rounded p-2 shadow-lg pointer-events-none z-10 bottom-5 right-5 mb-[200px] border-gray-600 backdrop-blur-lg">
+              <BeadTooltip {...hoveredBead} />
+            </div>
+          )}
         </div>
       </div>
       {/*  Beads Table */}
@@ -928,7 +1102,7 @@ const GraphVisualization: React.FC = () => {
                             className="font-mono text-xs "
                             title={bead.hash}
                           >
-                            {bead.hash.slice(0, 16)}...{bead.hash.slice(-8)}
+                            {shortenHash(bead.hash, 16, 8)}
                           </span>
                         </div>
                       </td>
@@ -988,9 +1162,7 @@ const GraphVisualization: React.FC = () => {
                                       className="font-mono text-xs text-white flex items-center gap-2"
                                       title={ph}
                                     >
-                                      <span>
-                                        {ph.slice(0, 16)}...{ph.slice(-12)}
-                                      </span>
+                                      <span>{shortenHash(ph, 16, 12)}</span>
                                     </div>
                                   ))}
                                 </div>
@@ -1014,9 +1186,7 @@ const GraphVisualization: React.FC = () => {
                                         className="font-mono text-xs text-[#48CAE4] flex items-center gap-2"
                                         title={ch}
                                       >
-                                        <span>
-                                          {ch.slice(0, 16)}...{ch.slice(-12)}
-                                        </span>
+                                        <span>{shortenHash(ch, 16, 12)}</span>
                                       </div>
                                     ))}
                                   {bead.childCount > 5 && (
